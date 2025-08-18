@@ -102,8 +102,8 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		log.Debug("CallConstructor: GetContractCreator failed", "address", address.Hex(), "err", err)
 		return nil, err
 	}
-	
-	log.Debug("CallConstructor: Found contract creation data", 
+
+	log.Debug("CallConstructor: Found contract creation data",
 		"contractAddr", address.Hex(),
 		"creationTx", creationData.Tx.Hex())
 
@@ -170,6 +170,21 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		baseFee.SetFromBig(parent.BaseFee)
 	}
 
+	// Handle Cancun fork compatibility - set ExcessBlobGas if needed
+	var excessBlobGas *uint64
+	if parent.ExcessBlobGas != nil {
+		excessBlobGas = parent.ExcessBlobGas
+	} else if chainConfig.IsCancun(parent.Time) {
+		// If Cancun is active but ExcessBlobGas is nil, set it to 0
+		zero := uint64(0)
+		excessBlobGas = &zero
+	}
+
+	var blobBaseFee *uint256.Int
+	if excessBlobGas != nil {
+		blobBaseFee = new(uint256.Int)
+	}
+
 	blockCtx = evmtypes.BlockContext{
 		CanTransfer:      core.CanTransfer,
 		Transfer:         consensus.Transfer,
@@ -180,6 +195,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		Difficulty:       new(big.Int).Set(parent.Difficulty),
 		GasLimit:         parent.GasLimit,
 		BaseFee:          &baseFee,
+		BlobBaseFee:      blobBaseFee,
 		L1CostFunc:       opstack.NewL1CostFunc(chainConfig, statedb),
 		OperatorCostFunc: opstack.NewOperatorCostFunc(chainConfig, statedb),
 	}
@@ -221,19 +237,22 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 	contractAddr := crypto.CreateAddress(msg.From(), msg.Nonce())
 	// Check for CREATE2 possibility as well
 	contractAddr2 := crypto.CreateAddress2(msg.From(), [32]byte{}, msg.Data())
-	
+
 	isCreateTx := creationTx.GetTo() == nil && contractAddr == address
 	isCreate2Tx := creationTx.GetTo() == nil && contractAddr2 == address
-	
-	log.Debug("CallConstructor analysis", 
-		"txTo", creationTx.GetTo(), 
+
+	log.Debug("CallConstructor analysis",
+		"txTo", creationTx.GetTo(),
 		"calculatedCreateAddr", contractAddr.Hex(),
 		"calculatedCreate2Addr", contractAddr2.Hex(),
-		"targetAddr", address.Hex(), 
+		"targetAddr", address.Hex(),
 		"isCreateTx", isCreateTx,
 		"isCreate2Tx", isCreate2Tx,
-		"txHash", creationTx.Hash().Hex())
-	
+		"txHash", creationTx.Hash().Hex(),
+		"blockNumber", blockNum,
+		"isCancun", chainConfig.IsCancun(block.Time()),
+		"excessBlobGas", block.Header().ExcessBlobGas)
+
 	if isCreateTx || isCreate2Tx {
 		// CREATE/CREATE2: adapt message with new code so it's replaced instantly
 		msg = types.NewMessage(msg.From(), msg.To(), msg.Nonce(), msg.Value(), api.GasCap, msg.GasPrice(), msg.FeeCap(), msg.Tip(), *code, msg.AccessList(), msg.CheckNonce(), msg.IsFree(), true, msg.MaxFeePerBlobGas())
@@ -242,32 +261,32 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		msg.ChangeGas(api.GasCap, api.GasCap)
 		log.Debug("CallConstructor: Using tracer path for unknown creation type")
 	}
-	
+
 	txCtx = core.NewEVMTxContext(msg)
 	ct := OverlayCreateTracer{contractAddress: address, code: *code, gasCap: api.GasCap}
 	evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: true, Tracer: &ct})
 	// Execute the transaction message
 	result, err := core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
-	
+
 	var resultFailed bool
 	if result != nil {
 		resultFailed = result.Failed()
 	}
-	
-	log.Debug("CallConstructor execution result", 
+
+	log.Debug("CallConstructor execution result",
 		"applyErr", err,
 		"tracerErr", ct.err,
 		"resultFailed", resultFailed,
 		"tracerCodeLen", len(ct.resultCode),
 		"isCapturing", ct.isCapturing)
-	
+
 	if ct.err != nil {
 		log.Debug("CallConstructor: tracer error", "err", ct.err)
 		return nil, ct.err
 	}
 
 	resultCode := &CreationCode{}
-	
+
 	// For CREATE/CREATE2 transactions, get the deployed code directly
 	if isCreateTx || isCreate2Tx {
 		deployedCode := evm.IntraBlockState().GetCode(address)
@@ -279,7 +298,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 			return resultCode, nil
 		}
 	}
-	
+
 	// For CREATE2 or when tracer captured code
 	if ct.resultCode != nil && len(ct.resultCode) > 0 {
 		c := hexutility.Bytes(ct.resultCode)
@@ -404,7 +423,7 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 		if account.Code != nil {
 			hasCodeOverrides = true
 		}
-		
+
 		fromB, err := bitmapdb.Get64(tx, kv.CallFromIndex, overlayAddress.Bytes(), begin, end+1)
 		if err != nil {
 			log.Error(err.Error())
