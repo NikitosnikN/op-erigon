@@ -35,18 +35,25 @@ func (ct *OverlayCreateTracer) CaptureStart(env *vm.EVM, from libcommon.Address,
 	if create && to == ct.contractAddress && !ct.isCapturing {
 		log.Debug("OverlayCreateTracer: Starting capture for top-level CREATE")
 		ct.isCapturing = true
-		_, _, _, err := ct.evm.OverlayCreate(vm.AccountRef(from), vm.NewCodeAndHash(ct.code), ct.gasCap, value, to, vm.CREATE, true /* incrementNonce */)
-		if err != nil {
-			log.Debug("OverlayCreateTracer: OverlayCreate error", "err", err)
-			ct.err = err
-		} else {
-			ct.resultCode = ct.evm.IntraBlockState().GetCode(ct.contractAddress)
-			log.Debug("OverlayCreateTracer: Captured code", "codeLen", len(ct.resultCode))
-		}
+		// Don't call OverlayCreate here - let the transaction execute normally
+		// We'll capture the result in CaptureEnd
 	}
 }
 func (ct *OverlayCreateTracer) CaptureEnd(output []byte, usedGas uint64, err error) {
-	log.Debug("OverlayCreateTracer CaptureEnd", "outputLen", len(output), "err", err)
+	log.Debug("OverlayCreateTracer CaptureEnd", "outputLen", len(output), "err", err, "isCapturing", ct.isCapturing)
+	
+	if ct.isCapturing && err == nil {
+		// Transaction succeeded, now replace the deployed code with our custom code
+		log.Debug("OverlayCreateTracer: Replacing deployed code with custom code")
+		ct.evm.IntraBlockState().SetCode(ct.contractAddress, ct.code)
+		ct.resultCode = ct.code
+		log.Debug("OverlayCreateTracer: Set custom code", "codeLen", len(ct.code))
+	} else if ct.isCapturing && err != nil {
+		log.Debug("OverlayCreateTracer: CREATE failed, trying direct deployment")
+		// If the original CREATE failed, try to deploy our code directly
+		ct.evm.IntraBlockState().SetCode(ct.contractAddress, ct.code)
+		ct.resultCode = ct.code
+	}
 }
 
 // Rest of the frames
