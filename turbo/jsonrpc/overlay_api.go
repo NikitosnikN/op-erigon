@@ -99,8 +99,13 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 
 	creationData, err := api.OtsAPI.GetContractCreator(ctx, address)
 	if err != nil {
+		log.Debug("CallConstructor: GetContractCreator failed", "address", address.Hex(), "err", err)
 		return nil, err
 	}
+	
+	log.Debug("CallConstructor: Found contract creation data", 
+		"contractAddr", address.Hex(),
+		"creationTx", creationData.Tx.Hex())
 
 	blockNum, ok, err := api.txnLookup(ctx, tx, creationData.Tx)
 	if err != nil {
@@ -214,32 +219,63 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 	}
 
 	contractAddr := crypto.CreateAddress(msg.From(), msg.Nonce())
-	isCreateTx := creationTx.GetTo() == nil && contractAddr == address
+	// Check for CREATE2 possibility as well
+	contractAddr2 := crypto.CreateAddress2(msg.From(), [32]byte{}, msg.Data())
 	
-	if isCreateTx {
-		// CREATE: adapt message with new code so it's replaced instantly
+	isCreateTx := creationTx.GetTo() == nil && contractAddr == address
+	isCreate2Tx := creationTx.GetTo() == nil && contractAddr2 == address
+	
+	log.Debug("CallConstructor analysis", 
+		"txTo", creationTx.GetTo(), 
+		"calculatedCreateAddr", contractAddr.Hex(),
+		"calculatedCreate2Addr", contractAddr2.Hex(),
+		"targetAddr", address.Hex(), 
+		"isCreateTx", isCreateTx,
+		"isCreate2Tx", isCreate2Tx,
+		"txHash", creationTx.Hash().Hex())
+	
+	if isCreateTx || isCreate2Tx {
+		// CREATE/CREATE2: adapt message with new code so it's replaced instantly
 		msg = types.NewMessage(msg.From(), msg.To(), msg.Nonce(), msg.Value(), api.GasCap, msg.GasPrice(), msg.FeeCap(), msg.Tip(), *code, msg.AccessList(), msg.CheckNonce(), msg.IsFree(), true, msg.MaxFeePerBlobGas())
+		log.Debug("CallConstructor: Using CREATE/CREATE2 path with replaced code")
 	} else {
 		msg.ChangeGas(api.GasCap, api.GasCap)
+		log.Debug("CallConstructor: Using tracer path for unknown creation type")
 	}
 	
 	txCtx = core.NewEVMTxContext(msg)
 	ct := OverlayCreateTracer{contractAddress: address, code: *code, gasCap: api.GasCap}
 	evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: true, Tracer: &ct})
 	// Execute the transaction message
-	_, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
+	result, err := core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
+	
+	var resultFailed bool
+	if result != nil {
+		resultFailed = result.Failed()
+	}
+	
+	log.Debug("CallConstructor execution result", 
+		"applyErr", err,
+		"tracerErr", ct.err,
+		"resultFailed", resultFailed,
+		"tracerCodeLen", len(ct.resultCode),
+		"isCapturing", ct.isCapturing)
+	
 	if ct.err != nil {
+		log.Debug("CallConstructor: tracer error", "err", ct.err)
 		return nil, ct.err
 	}
 
 	resultCode := &CreationCode{}
 	
-	// For CREATE transactions, get the deployed code directly
-	if isCreateTx {
+	// For CREATE/CREATE2 transactions, get the deployed code directly
+	if isCreateTx || isCreate2Tx {
 		deployedCode := evm.IntraBlockState().GetCode(address)
+		log.Debug("CallConstructor CREATE/CREATE2 path", "deployedCodeLen", len(deployedCode))
 		if len(deployedCode) > 0 {
 			c := hexutility.Bytes(deployedCode)
 			resultCode.Code = &c
+			log.Debug("CallConstructor: returning CREATE/CREATE2 result", "codeLen", len(deployedCode))
 			return resultCode, nil
 		}
 	}
@@ -248,23 +284,27 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 	if ct.resultCode != nil && len(ct.resultCode) > 0 {
 		c := hexutility.Bytes(ct.resultCode)
 		resultCode.Code = &c
+		log.Debug("CallConstructor: returning tracer result", "codeLen", len(ct.resultCode))
 		return resultCode, nil
 	} else {
 		// err from core.ApplyMessage()
 		if err != nil {
+			log.Debug("CallConstructor: ApplyMessage error", "err", err)
 			return nil, err
 		}
 		code := evm.IntraBlockState().GetCode(address)
+		log.Debug("CallConstructor fallback", "codeLen", len(code))
 		if len(code) > 0 {
 			c := hexutility.Bytes(code)
 			resultCode.Code = &c
+			log.Debug("CallConstructor: returning fallback result", "codeLen", len(code))
 			return resultCode, nil
 		}
 	}
 
 	_ = statedb.FinalizeTx(rules, state.NewNoopWriter())
 
-	return nil, nil
+	return nil, fmt.Errorf("no deployed code found for contract at address %s", address.Hex())
 }
 
 func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria, stateOverride *ethapi.StateOverrides) ([]*types.Log, error) {
