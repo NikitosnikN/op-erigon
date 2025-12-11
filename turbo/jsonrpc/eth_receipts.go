@@ -5,8 +5,6 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	"github.com/erigontech/erigon-lib/opstack"
-
 	"github.com/RoaringBitmap/roaring"
 	"github.com/erigontech/erigon-lib/log/v3"
 
@@ -18,6 +16,7 @@ import (
 	"github.com/erigontech/erigon-lib/kv/iter"
 	"github.com/erigontech/erigon-lib/kv/order"
 	"github.com/erigontech/erigon-lib/kv/rawdbv3"
+	"github.com/erigontech/erigon-lib/opstack"
 	"github.com/erigontech/erigon/eth/ethutils"
 	bortypes "github.com/erigontech/erigon/polygon/bor/types"
 
@@ -83,10 +82,25 @@ func (api *BaseAPI) getReceipts(ctx context.Context, tx kv.Tx, block *types.Bloc
 		}
 
 		if header.Number != nil && chainConfig.IsOptimismBedrock(header.Number.Uint64()) {
-			gasParams, err := opstack.ExtractL1GasParams(chainConfig, header.Time, block.Transactions()[0].GetData())
-			if err == nil && txn.Type() != types.DepositTxType {
+			if txn.Type() != types.DepositTxType {
+				gasParams, err := opstack.ExtractL1GasParams(chainConfig, header.Time, block.Transactions()[0].GetData())
+				if err != nil {
+					return nil, err
+				}
+
+				var daFootprintGasScalar uint64
+				isJovian := chainConfig.IsJovian(header.Time)
+				if isJovian {
+					scalar, err := opstack.ExtractDAFootprintGasScalar(block.Transactions()[0].GetData())
+					if err != nil {
+						return nil, fmt.Errorf("failed to extract DA footprint gas scalar: %w", err)
+					}
+					daFootprintGasScalar = uint64(scalar)
+				}
+
 				receipt.L1GasPrice = gasParams.L1BaseFee.ToBig()
-				l1Fee, l1GasUsed := gasParams.CostFunc(txn.RollupCostData())
+				rcd := txn.RollupCostData()
+				l1Fee, l1GasUsed := gasParams.CostFunc(rcd)
 				receipt.L1Fee = l1Fee.ToBig()
 				receipt.L1GasUsed = l1GasUsed.ToBig()
 				receipt.FeeScalar = gasParams.FeeScalar
@@ -105,6 +119,10 @@ func (api *BaseAPI) getReceipts(ctx context.Context, tx kv.Tx, block *types.Bloc
 				}
 				if gasParams.OperatorFeeConstant != nil {
 					receipt.L1BaseFeeScalar = gasParams.OperatorFeeConstant
+				}
+				if isJovian {
+					receipt.DAFootprintGasScalar = &daFootprintGasScalar
+					receipt.BlobGasUsed = daFootprintGasScalar * rcd.EstimatedDASize().Uint64()
 				}
 			}
 		}
