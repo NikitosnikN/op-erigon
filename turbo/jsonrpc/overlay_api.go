@@ -165,6 +165,20 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		baseFee.SetFromBig(parent.BaseFee)
 	}
 
+	// Handle Cancun fork compatibility
+	var excessBlobGas *uint64
+	if parent.ExcessBlobGas != nil {
+		excessBlobGas = parent.ExcessBlobGas
+	} else if chainConfig.IsCancun(parent.Time) {
+		zero := uint64(0)
+		excessBlobGas = &zero
+	}
+
+	var blobBaseFee *uint256.Int
+	if excessBlobGas != nil {
+		blobBaseFee = new(uint256.Int)
+	}
+
 	blockCtx = evmtypes.BlockContext{
 		CanTransfer:      core.CanTransfer,
 		Transfer:         consensus.Transfer,
@@ -175,6 +189,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 		Difficulty:       new(big.Int).Set(parent.Difficulty),
 		GasLimit:         parent.GasLimit,
 		BaseFee:          &baseFee,
+		BlobBaseFee:      blobBaseFee,
 		L1CostFunc:       opstack.NewL1CostFunc(chainConfig, statedb),
 		OperatorCostFunc: opstack.NewOperatorCostFunc(chainConfig, statedb),
 	}
@@ -214,22 +229,43 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 	}
 
 	contractAddr := crypto.CreateAddress(msg.From(), msg.Nonce())
-	if creationTx.GetTo() == nil && contractAddr == address {
-		// CREATE: adapt message with new code so it's replaced instantly
+	contractAddr2 := crypto.CreateAddress2(msg.From(), [32]byte{}, msg.Data())
+
+	isCreateTx := creationTx.GetTo() == nil && contractAddr == address
+	isCreate2Tx := creationTx.GetTo() == nil && contractAddr2 == address
+
+	if isCreateTx || isCreate2Tx {
 		msg = types.NewMessage(msg.From(), msg.To(), msg.Nonce(), msg.Value(), api.GasCap, msg.GasPrice(), msg.FeeCap(), msg.Tip(), *code, msg.AccessList(), msg.CheckNonce(), msg.IsFree(), true, msg.MaxFeePerBlobGas())
 	} else {
 		msg.ChangeGas(api.GasCap, api.GasCap)
 	}
+
 	txCtx = core.NewEVMTxContext(msg)
 	ct := OverlayCreateTracer{contractAddress: address, code: *code, gasCap: api.GasCap}
 	evm = vm.NewEVM(blockCtx, txCtx, evm.IntraBlockState(), chainConfig, vm.Config{Debug: true, Tracer: &ct})
-	// Execute the transaction message
-	_, err = core.ApplyMessage(evm, msg, gp, true /* refunds */, true /* gasBailout */)
+
+	_, err = core.ApplyMessage(evm, msg, gp, true, true)
+
 	if ct.err != nil {
-		return nil, err
+		log.Debug("CallConstructor: tracer error", "err", ct.err)
+		return nil, ct.err
 	}
 
 	resultCode := &CreationCode{}
+
+	// For CREATE/CREATE2 transactions, get the deployed code directly
+	if isCreateTx || isCreate2Tx {
+		deployedCode := evm.IntraBlockState().GetCode(address)
+		log.Debug("CallConstructor CREATE/CREATE2 path", "deployedCodeLen", len(deployedCode))
+		if len(deployedCode) > 0 {
+			c := hexutility.Bytes(deployedCode)
+			resultCode.Code = &c
+			log.Debug("CallConstructor: returning CREATE/CREATE2 result", "codeLen", len(deployedCode))
+			return resultCode, nil
+		}
+	}
+
+	// For CREATE2 or when tracer captured code
 	if ct.resultCode != nil && len(ct.resultCode) > 0 {
 		c := hexutility.Bytes(ct.resultCode)
 		resultCode.Code = &c
@@ -249,7 +285,7 @@ func (api *OverlayAPIImpl) CallConstructor(ctx context.Context, address common.A
 
 	_ = statedb.FinalizeTx(rules, state.NewNoopWriter())
 
-	return nil, nil
+	return nil, fmt.Errorf("no deployed code found for contract at address %s", address.Hex())
 }
 
 func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCriteria, stateOverride *ethapi.StateOverrides) ([]*types.Log, error) {
@@ -341,9 +377,15 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 	}
 
 	hasOverrides := false
+	hasCodeOverrides := false
 	allBlocks := roaring64.New()
-	for overlayAddress := range *stateOverride {
+	for overlayAddress, account := range *stateOverride {
 		hasOverrides = true
+
+		if account.Code != nil {
+			hasCodeOverrides = true
+		}
+
 		fromB, err := bitmapdb.Get64(tx, kv.CallFromIndex, overlayAddress.Bytes(), begin, end+1)
 		if err != nil {
 			log.Error(err.Error())
@@ -364,7 +406,7 @@ func (api *OverlayAPIImpl) GetLogs(ctx context.Context, crit filters.FilterCrite
 	idx := 0
 blockLoop:
 	for blockNumber := begin; blockNumber <= end; blockNumber++ {
-		if hasOverrides && !allBlocks.Contains(blockNumber) {
+		if hasOverrides && !hasCodeOverrides && !allBlocks.Contains(blockNumber) {
 			log.Debug("skipping untouched blocked", "blockNumber", blockNumber)
 			continue
 		}
