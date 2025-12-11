@@ -56,6 +56,8 @@ func MarshalReceipt(
 
 	if !chainConfig.IsLondon(header.Number.Uint64()) {
 		fields["effectiveGasPrice"] = (*hexutil.Big)(txn.GetPrice().ToBig())
+	} else if txn.Type() == types.DepositTxType {
+		fields["effectiveGasPrice"] = (*hexutil.Big)(big.NewInt(0))
 	} else {
 		baseFee, _ := uint256.FromBig(header.BaseFee)
 		gasPrice := new(big.Int).Add(header.BaseFee, txn.GetEffectiveGasTip(baseFee).ToBig())
@@ -97,6 +99,12 @@ func MarshalReceipt(
 			}
 			if receipt.OperatorFeeConstant != nil {
 				fields["operatorFeeConstant"] = hexutil.Uint64(*receipt.OperatorFeeConstant)
+			}
+			// Fields added in Jovian
+			if receipt.DAFootprintGasScalar != nil {
+				fields["daFootprintGasScalar"] = hexutil.Uint64(*receipt.DAFootprintGasScalar)
+				// Jovian repurposes blobGasUsed for DA footprint gas used
+				fields["blobGasUsed"] = hexutil.Uint64(receipt.BlobGasUsed)
 			}
 		} else {
 			if receipt.DepositNonce != nil {
